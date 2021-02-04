@@ -1,7 +1,7 @@
 'use strict';
 
 var util = require('util');
-var uuid = require('uuid');
+var ObjectID = require('bson-objectid');
 var crypto = require('crypto');
 var ecdsaSigFormatter = require('ecdsa-sig-formatter');
 var properties = require('./properties.json');
@@ -39,9 +39,8 @@ function nowEpochSeconds() {
   return Math.floor(new Date().getTime() / 1000);
 }
 
-function base64urlEncode(data) {
-  const str = typeof data === 'number' ? data.toString() : data;
-  return Buffer.from(str)
+function base64urlEncode(str) {
+  return new Buffer(str)
     .toString('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
@@ -67,10 +66,6 @@ function handleError(cb, err, value) {
   } else {
     return value;
   }
-}
-
-function defaultKeyResolver(kid, cb) {
-  return cb(null, this.signingKey);
 }
 
 function JwtError(message) {
@@ -149,7 +144,7 @@ function Jwt(claims, enforceDefaultFields) {
     this.setSigningAlgorithm('none');
 
     if (!this.body.jti) {
-      this.setJti(uuid.v4());
+      this.setJti(ObjectID().toString());
     }
 
     if (!this.body.iat) {
@@ -159,14 +154,6 @@ function Jwt(claims, enforceDefaultFields) {
 
   return this;
 }
-Jwt.prototype.setClaim = function setClaim(claim, value) {
-  this.body[claim] = value;
-  return this;
-};
-Jwt.prototype.setHeader = function setHeader(param, value) {
-  this.header[param] = value;
-  return this;
-};
 Jwt.prototype.setJti = function setJti(jti) {
   this.body.jti = jti;
   return this;
@@ -183,6 +170,7 @@ Jwt.prototype.setIssuedAt = function setIssuedAt(iat) {
   this.body.iat = iat;
   return this;
 };
+// setExpiration wants a timestamp in miliseconds
 Jwt.prototype.setExpiration = function setExpiration(exp) {
   if (exp) {
     this.body.exp = Math.floor((exp instanceof Date ? exp : new Date(exp)).getTime() / 1000);
@@ -205,6 +193,11 @@ Jwt.prototype.setSigningKey = function setSigningKey(key) {
   this.signingKey = key;
   return this;
 };
+Jwt.prototype.setSigningKeyId = function setSigningKeyId(kid) {
+  this.header.kid = kid;
+  return this;
+};
+
 Jwt.prototype.setSigningAlgorithm = function setSigningAlgorithm(alg) {
   if (!this.isSupportedAlg(alg)) {
     throw new JwtError(properties.errors.UNSUPPORTED_SIGNING_ALG);
@@ -262,14 +255,17 @@ Jwt.prototype.toString = function () {
 };
 
 Jwt.prototype.isExpired = function () {
-  return new Date(this.body.exp * 1000) < new Date();
+  return new Date(this.body.exp) < nowEpochSeconds();
 };
 
-Jwt.prototype.isNotBefore = function (ms) {
-  return new Date(this.body.nbf * 1000 - ms) >= new Date();
+Jwt.prototype.isNotBefore = function () {
+  return new Date(this.body.nbf) >= nowEpochSeconds();
 };
 
 function Parser(options) {
+  if (!(this instanceof Parser)) {
+    return new Parser(options);
+  }
   return this;
 }
 
@@ -277,7 +273,7 @@ Parser.prototype.isSupportedAlg = isSupportedAlg;
 Parser.prototype.safeJsonParse = function (input) {
   var result;
   try {
-    result = JSON.parse(Buffer.from(base64urlUnescape(input), 'base64'));
+    result = JSON.parse(new Buffer(base64urlUnescape(input), 'base64'));
   } catch (e) {
     return e;
   }
@@ -296,7 +292,7 @@ Parser.prototype.parse = function parse(jwtString, cb) {
   var body = this.safeJsonParse(segments[1]);
 
   if (segments[2]) {
-    signature = Buffer.from(base64urlUnescape(segments[2]), 'base64').toString('base64');
+    signature = new Buffer(base64urlUnescape(segments[2]), 'base64').toString('base64');
   }
 
   if (header instanceof Error) {
@@ -318,8 +314,6 @@ function Verifier() {
     return new Verifier();
   }
   this.setSigningAlgorithm('HS256');
-  this.setKeyResolver(defaultKeyResolver.bind(this));
-  this.nbfTolerance = 0;
   return this;
 }
 Verifier.prototype.setSigningAlgorithm = function setSigningAlgorithm(alg) {
@@ -333,13 +327,6 @@ Verifier.prototype.setSigningKey = function setSigningKey(keyStr) {
   this.signingKey = keyStr;
   return this;
 };
-Verifier.prototype.setKeyResolver = function setKeyResolver(keyResolver) {
-  this.keyResolver = keyResolver.bind(this);
-};
-Verifier.prototype.setNbfTolerance = function setNbfTolerance(ms) {
-  this.nbfTolerance = ms;
-  return this;
-};
 Verifier.prototype.isSupportedAlg = isSupportedAlg;
 
 Verifier.prototype.verify = function verify(jwtString, cb) {
@@ -347,12 +334,16 @@ Verifier.prototype.verify = function verify(jwtString, cb) {
 
   var done = handleError.bind(null, cb);
 
-  try {
-    jwt = new Parser().parse(jwtString);
-  } catch (e) {
-    return done(e);
+  if (jwtString instanceof Jwt) {
+    jwt = jwtString;
+    // console.log(jwt)
+  } else {
+    try {
+      jwt = new Parser().parse(jwtString);
+    } catch (e) {
+      return done(e);
+    }
   }
-
   var body = jwt.body;
   var header = jwt.header;
   var signature = jwt.signature;
@@ -370,121 +361,89 @@ Verifier.prototype.verify = function verify(jwtString, cb) {
     return done(new JwtParseError(properties.errors.EXPIRED, jwtString, header, body));
   }
 
-  if (jwt.isNotBefore(this.nbfTolerance)) {
+  if (jwt.isNotBefore()) {
     return done(new JwtParseError(properties.errors.NOT_ACTIVE, jwtString, header, body));
   }
 
   var digstInput = jwt.verificationInput;
   var verified, digest;
 
-  return this.keyResolver(header.kid, function (err, signingKey) {
-    if (err) {
-      return done(
-        new JwtParseError(
-          util.format(properties.errors.KEY_RESOLVER_ERROR, header.kid),
-          jwtString,
-          header,
-          body,
-          err
-        )
-      );
-    }
+  if (cryptoAlgName === 'none') {
+    verified = true;
+  } else if (signingType === 'hmac') {
+    digest = crypto.createHmac(cryptoAlgName, this.signingKey).update(digstInput).digest('base64');
+    verified = signature === digest;
+  } else {
+    var unescapedSignature;
+    var signatureType = undefined;
 
-    if (cryptoAlgName === 'none') {
-      verified = true;
-    } else if (signingType === 'hmac') {
-      digest = crypto.createHmac(cryptoAlgName, signingKey).update(digstInput).digest('base64');
-      verified = signature === digest;
-    } else {
-      var unescapedSignature;
-      var signatureType = undefined;
-
-      if (isECDSA(header.alg)) {
-        try {
-          unescapedSignature = ecdsaSigFormatter.joseToDer(signature, header.alg);
-        } catch (err) {
-          return done(
-            new JwtParseError(properties.errors.SIGNATURE_MISMTACH, jwtString, header, body, err)
-          );
-        }
-      } else {
-        signatureType = 'base64';
-        unescapedSignature = base64urlUnescape(signature);
+    if (isECDSA(header.alg)) {
+      try {
+        unescapedSignature = ecdsaSigFormatter.joseToDer(signature, header.alg);
+      } catch (err) {
+        return done(
+          new JwtParseError(properties.errors.SIGNATURE_MISMTACH, jwtString, header, body, err)
+        );
       }
-
-      verified = crypto
-        .createVerify(cryptoAlgName)
-        .update(digstInput)
-        .verify(signingKey, unescapedSignature, signatureType);
+    } else {
+      signatureType = 'base64';
+      unescapedSignature = base64urlUnescape(signature);
     }
 
-    var newJwt = new Jwt(body, false);
+    verified = crypto
+      .createVerify(cryptoAlgName)
+      .update(digstInput)
+      .verify(this.signingKey, unescapedSignature, signatureType);
+  }
 
-    newJwt.toString = function () {
-      return jwtString;
-    };
+  var newJwt = new Jwt(body, false);
 
-    newJwt.header = new JwtHeader(header);
+  newJwt.toString = function () {
+    return jwtString;
+  };
 
-    if (!verified) {
-      return done(new JwtParseError(properties.errors.SIGNATURE_MISMTACH, jwtString, header, body));
-    }
+  newJwt.header = new JwtHeader(header);
 
-    return done(null, newJwt);
-  });
-};
+  if (!verified) {
+    return done(new JwtParseError(properties.errors.SIGNATURE_MISMTACH, jwtString, header, body));
+  }
 
-Verifier.prototype.withKeyResolver = function withKeyResolver(keyResolver) {
-  this.keyResolver = keyResolver;
-  return this;
+  return done(null, newJwt);
 };
 
 var jwtLib = {
   Jwt: Jwt,
   JwtBody: JwtBody,
+  nowEpochSeconds: nowEpochSeconds,
   JwtHeader: JwtHeader,
+  Parser: Parser,
   Verifier: Verifier,
   base64urlEncode: base64urlEncode,
   base64urlUnescape: base64urlUnescape,
-  verify: function (/*jwtTokenString, [signingKey], [algOverride], [nbfTolerance], [callback] */) {
+  verify: function (jwtString, secret, alg, cb) {
     var args = Array.prototype.slice.call(arguments);
-    var cb = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+
+    if (typeof args[args.length - 1] === 'function') {
+      cb = args.pop();
+    } else {
+      cb = null;
+    }
 
     var verifier = new Verifier();
 
-    if (args.length === 4) {
-      verifier.setNbfTolerance(args[3]);
-
-      if (args[2] == null) {
-        verifier.setSigningAlgorithm('none');
-      } else {
-        verifier.setSigningAlgorithm(args[2]);
-      }
-
-      if (args[1] == null) {
-        verifier.setSigningKey('');
-      } else {
-        verifier.setSigningKey(args[1]);
-      }
-    }
-
     if (args.length === 3) {
-      verifier.setSigningAlgorithm(args[2]);
-      verifier.setSigningKey(args[1]);
-    }
-
-    if (args.length === 2) {
-      verifier.setSigningKey(args[1]);
+      verifier.setSigningAlgorithm(alg);
+    } else {
+      verifier.setSigningAlgorithm('HS256');
     }
 
     if (args.length === 1) {
       verifier.setSigningAlgorithm('none');
+    } else {
+      verifier.setSigningKey(secret);
     }
 
-    return verifier.verify(args[0], cb);
-  },
-  createVerifier: function () {
-    return new Verifier();
+    return verifier.verify(jwtString, cb);
   },
   create: function (claims, secret, alg) {
     var args = Array.prototype.slice.call(arguments);
@@ -508,4 +467,4 @@ var jwtLib = {
   },
 };
 
-module.exports = jwtLib;
+module.exports = keyjwtlib;

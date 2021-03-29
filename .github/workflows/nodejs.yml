@@ -1,7 +1,7 @@
 # GitHub Nodejs CI
 name: nodejs
 
-on: [push, pull_request]
+on: [push]
 
 jobs:
   build:
@@ -20,8 +20,8 @@ jobs:
           check-latest: true
       - name: npm install, build, and test
         run: |
-          npm install codecov -g
           npm install
-          codecov
+          npm test
+          npm test-cov
         env:
           CI: true
